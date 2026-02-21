@@ -9,6 +9,8 @@ import logging
 import asyncio
 import aiohttp
 import re
+import tempfile
+import shutil
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional
@@ -124,7 +126,7 @@ async def telegram_webhook(request: Request):
     return Response(status_code=200)
 
 
-# GigaFile Upload API
+# GigaFile Upload API - MEMORY-SAFE: streams file to disk first
 @api_router.post("/upload", response_model=UploadResponse, summary="Upload file to GigaFile.nu")
 async def upload_to_gigafile(
     file: Optional[UploadFile] = File(None),
@@ -138,10 +140,28 @@ async def upload_to_gigafile(
         if url:
             result = await gigafile_client.upload_from_url(url, lifetime=duration)
         elif file:
-            data = await file.read()
-            result = await gigafile_client.upload_bytes(
-                data, file.filename or 'upload', lifetime=duration
-            )
+            # MEMORY-SAFE: stream uploaded file to disk instead of reading into RAM
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename or 'upload'}") as tmp:
+                    tmp_path = tmp.name
+                    # Stream in 2MB chunks to avoid loading entire file into memory
+                    while True:
+                        chunk = await file.read(2 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        tmp.write(chunk)
+
+                result = await gigafile_client.upload_file_path(
+                    tmp_path, lifetime=duration,
+                    original_filename=file.filename or 'upload',
+                )
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
         else:
             raise HTTPException(status_code=400, detail="Provide 'file' or 'url'")
 
@@ -166,7 +186,7 @@ async def upload_to_gigafile(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# GigaFile Proxy Download
+# GigaFile Proxy Download - streaming (already memory-safe)
 @api_router.get("/proxy", summary="Proxy-download from GigaFile")
 async def proxy_gigafile(url: str):
     if 'gigafile.nu' not in url:

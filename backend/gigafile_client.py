@@ -1,6 +1,7 @@
 """
-GigaFile.nu async client - OPTIMIZED
-- Parallel chunk uploads (up to 4 concurrent)
+GigaFile.nu async client - MEMORY-SAFE
+- Streaming chunk uploads (reads from disk, never loads all chunks into RAM)
+- Parallel chunk uploads with bounded concurrency (up to 4 concurrent)
 - Larger chunk size (50MB) for speed
 - Robust timeouts (sock_read, sock_connect) to prevent hangs
 - Retry logic for failed chunks and downloads
@@ -19,12 +20,12 @@ from urllib.parse import urlparse, unquote
 
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE = 50 * 1024 * 1024  # 50 MB per chunk (was 10MB)
+CHUNK_SIZE = 50 * 1024 * 1024  # 50 MB per chunk
 UPLOAD_CONCURRENCY = 4  # parallel chunk uploads
 VALID_LIFETIMES = {3, 5, 7, 14, 30, 60, 100}
 MAX_RETRIES = 3
 DOWNLOAD_READ_CHUNK = 2 * 1024 * 1024  # 2MB read buffer for downloads
-STALL_TIMEOUT = 120  # seconds - if no data received in this time, consider stalled
+STALL_TIMEOUT = 120  # seconds
 
 
 def _extract_filename_from_cd(cd: str) -> Optional[str]:
@@ -45,6 +46,13 @@ def _filename_from_url(url: str) -> str:
     return unquote(name) if name else 'file'
 
 
+def _read_chunk_from_file(filepath: str, chunk_no: int) -> bytes:
+    """Read a single chunk from file on disk. Memory-safe: only 1 chunk in RAM."""
+    with open(filepath, 'rb') as f:
+        f.seek(chunk_no * CHUNK_SIZE)
+        return f.read(CHUNK_SIZE)
+
+
 class GigaFileClient:
     def __init__(self):
         self._server_cache: str | None = None
@@ -53,7 +61,6 @@ class GigaFileClient:
     async def get_server(self) -> str:
         import time
         now = time.monotonic()
-        # Cache server for 5 minutes
         if self._server_cache and (now - self._server_cache_ts) < 300:
             return self._server_cache
 
@@ -104,55 +111,70 @@ class GigaFileClient:
                 await asyncio.sleep(2 ** attempt)
         return {}
 
-    async def _upload_chunks_parallel(
+    async def _upload_chunks_streaming(
         self,
         session: aiohttp.ClientSession,
         server: str,
         token: str,
         filename: str,
-        chunks: list[tuple[int, bytes]],
+        filepath: str,
         total_chunks: int,
         lifetime: int,
         progress_cb: Optional[Callable[[str, int], Awaitable[None]]] = None,
         cancel_event: Optional[asyncio.Event] = None,
     ) -> Optional[str]:
-        """Upload chunks with controlled parallelism. Returns result URL."""
+        """Upload chunks from disk with controlled parallelism.
+        MEMORY-SAFE: reads one chunk at a time from disk, never loads all into RAM.
+        """
         result_url = None
         sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
         completed = 0
         lock = asyncio.Lock()
 
-        async def upload_one(chunk_no: int, chunk_data: bytes):
+        # First chunk must go first to establish session on GigaFile
+        first_data = _read_chunk_from_file(filepath, 0)
+        r = await self._upload_chunk(session, server, token, filename, first_data, 0, total_chunks, lifetime)
+        del first_data  # free memory immediately
+        if 'url' in r:
+            result_url = r['url']
+        completed = 1
+        if progress_cb:
+            pct = min(99, int(completed * 100 / total_chunks))
+            await progress_cb('upload', pct)
+
+        if total_chunks <= 1:
+            return result_url
+
+        # Upload remaining chunks in parallel, reading from disk on-demand
+        async def upload_one(chunk_no: int):
             nonlocal result_url, completed
             if cancel_event and cancel_event.is_set():
                 return
             async with sem:
                 if cancel_event and cancel_event.is_set():
                     return
-                r = await self._upload_chunk(session, server, token, filename, chunk_data, chunk_no, total_chunks, lifetime)
+                # Read chunk from disk right before uploading (memory-safe)
+                chunk_data = await asyncio.get_event_loop().run_in_executor(
+                    None, _read_chunk_from_file, filepath, chunk_no
+                )
+                try:
+                    r = await self._upload_chunk(
+                        session, server, token, filename, chunk_data,
+                        chunk_no, total_chunks, lifetime
+                    )
+                finally:
+                    del chunk_data  # free memory immediately after upload
                 if 'url' in r:
-                    result_url = r['url']
+                    async with lock:
+                        result_url = r['url']
                 async with lock:
                     completed += 1
                     if progress_cb:
                         pct = min(99, int(completed * 100 / total_chunks))
                         await progress_cb('upload', pct)
 
-        # For GigaFile, first chunk must go first to establish session
-        if chunks:
-            first_no, first_data = chunks[0]
-            r = await self._upload_chunk(session, server, token, filename, first_data, first_no, total_chunks, lifetime)
-            if 'url' in r:
-                result_url = r['url']
-            completed = 1
-            if progress_cb:
-                pct = min(99, int(completed * 100 / total_chunks))
-                await progress_cb('upload', pct)
-
-            # Upload remaining chunks in parallel
-            if len(chunks) > 1:
-                tasks = [upload_one(cn, cd) for cn, cd in chunks[1:]]
-                await asyncio.gather(*tasks)
+        tasks = [upload_one(i) for i in range(1, total_chunks)]
+        await asyncio.gather(*tasks)
 
         return result_url
 
@@ -163,26 +185,24 @@ class GigaFileClient:
         lifetime: int = 100,
         progress_cb: Optional[Callable[[str, int], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
-        server = await self.get_server()
-        token = uuid.uuid1().hex
-        total_chunks = max(1, math.ceil(len(data) / CHUNK_SIZE))
+        """Upload bytes - saves to temp file first to use streaming upload."""
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp_path = tmp.name
+                tmp.write(data)
+            del data  # free the bytes from memory
 
-        # Prepare chunks
-        chunks = []
-        for i in range(total_chunks):
-            chunk = data[i * CHUNK_SIZE:(i + 1) * CHUNK_SIZE]
-            chunks.append((i, chunk))
-
-        connector = aiohttp.TCPConnector(limit=UPLOAD_CONCURRENCY + 2, force_close=False)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            result_url = await self._upload_chunks_parallel(
-                session, server, token, filename, chunks, total_chunks, lifetime, progress_cb
+            return await self.upload_file_path(
+                tmp_path, lifetime=lifetime, progress_cb=progress_cb,
+                original_filename=filename,
             )
-
-        if progress_cb:
-            await progress_cb('upload', 100)
-
-        return self._build_result(result_url, server, filename)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     async def _download_with_retry(
         self,
@@ -198,9 +218,9 @@ class GigaFileClient:
         for attempt in range(MAX_RETRIES):
             try:
                 timeout = aiohttp.ClientTimeout(
-                    total=7200,  # 2 hours max total
+                    total=7200,
                     sock_connect=30,
-                    sock_read=STALL_TIMEOUT,  # fail if no data for 120s
+                    sock_read=STALL_TIMEOUT,
                 )
 
                 own_session = False
@@ -236,9 +256,7 @@ class GigaFileClient:
                                     pct = min(99, int(downloaded * 100 / total_size))
                                     await progress_cb('download', pct)
                                 elif progress_cb and downloaded > 0:
-                                    # No Content-Length - show downloaded MB
                                     mb = downloaded / (1024 * 1024)
-                                    # Use a cycling percentage to show activity
                                     pct = min(95, int(mb) % 96)
                                     await progress_cb('download', pct)
 
@@ -281,7 +299,6 @@ class GigaFileClient:
         tmp_path = None
 
         try:
-            # Handle GigaFile URLs - need to visit page first for cookies
             actual_download_url = url
             gigafile_match = re.search(r'https?://(\d+)\.gigafile\.nu/', url)
 
@@ -300,7 +317,6 @@ class GigaFileClient:
                         file_id = page_url.rstrip('/').split('/')[-1]
                         server_host = page_url.split('/')[2]
                         actual_download_url = f"https://{server_host}/download.php?file={file_id}"
-                    # Visit page to get cookies
                     async with session.get(page_url, timeout=aiohttp.ClientTimeout(total=15)) as _:
                         pass
 
@@ -320,24 +336,15 @@ class GigaFileClient:
             if downloaded == 0 and os.path.getsize(tmp_path) == 0:
                 return {'success': False, 'error': 'Download failed - empty file'}
 
-            # Upload phase - parallel chunk uploads
+            # Upload phase - STREAMING from disk (memory-safe)
             file_size = os.path.getsize(tmp_path)
             total_chunks = max(1, math.ceil(file_size / CHUNK_SIZE))
 
-            # Read all chunks into memory for parallel upload
-            chunks = []
-            with open(tmp_path, 'rb') as f:
-                for i in range(total_chunks):
-                    if cancel_event and cancel_event.is_set():
-                        return {'success': False, 'error': 'cancelled'}
-                    chunk_data = f.read(CHUNK_SIZE)
-                    chunks.append((i, chunk_data))
-
             upload_connector = aiohttp.TCPConnector(limit=UPLOAD_CONCURRENCY + 2, force_close=False)
             async with aiohttp.ClientSession(connector=upload_connector) as up_session:
-                result_url = await self._upload_chunks_parallel(
-                    up_session, server, token, filename, chunks, total_chunks, lifetime,
-                    progress_cb, cancel_event
+                result_url = await self._upload_chunks_streaming(
+                    up_session, server, token, filename, tmp_path,
+                    total_chunks, lifetime, progress_cb, cancel_event
                 )
 
             if progress_cb:
@@ -357,24 +364,20 @@ class GigaFileClient:
         filepath: str,
         lifetime: int = 100,
         progress_cb: Optional[Callable[[str, int], Awaitable[None]]] = None,
+        original_filename: Optional[str] = None,
     ) -> Dict[str, Any]:
         server = await self.get_server()
         token = uuid.uuid1().hex
-        filename = os.path.basename(filepath)
+        filename = original_filename or os.path.basename(filepath)
         file_size = os.path.getsize(filepath)
         total_chunks = max(1, math.ceil(file_size / CHUNK_SIZE))
 
-        # Read chunks for parallel upload
-        chunks = []
-        with open(filepath, 'rb') as f:
-            for i in range(total_chunks):
-                chunk_data = f.read(CHUNK_SIZE)
-                chunks.append((i, chunk_data))
-
+        # STREAMING upload - reads from disk on-demand (memory-safe)
         upload_connector = aiohttp.TCPConnector(limit=UPLOAD_CONCURRENCY + 2, force_close=False)
         async with aiohttp.ClientSession(connector=upload_connector) as session:
-            result_url = await self._upload_chunks_parallel(
-                session, server, token, filename, chunks, total_chunks, lifetime, progress_cb
+            result_url = await self._upload_chunks_streaming(
+                session, server, token, filename, filepath,
+                total_chunks, lifetime, progress_cb
             )
 
         if progress_cb:
