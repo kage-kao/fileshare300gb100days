@@ -332,10 +332,6 @@ body {
   color: #555;
 }
 
-.input.small {
-  max-width: 140px;
-}
-
 /* Settings */
 .settings {
   margin-top: 24px;
