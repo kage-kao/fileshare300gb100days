@@ -1,11 +1,7 @@
 """
-GigaFile.nu async client - MEMORY-SAFE
-- Streaming chunk uploads (reads from disk, never loads all chunks into RAM)
-- Parallel chunk uploads with bounded concurrency (up to 4 concurrent)
-- Larger chunk size (50MB) for speed
-- Robust timeouts (sock_read, sock_connect) to prevent hangs
-- Retry logic for failed chunks and downloads
-- Streaming download with stall detection
+GigaFile.nu async client - MEMORY-SAFE for large files (4GB+)
+Key fix: chunks are read from disk ON DEMAND inside the semaphore,
+so only UPLOAD_CONCURRENCY * CHUNK_SIZE bytes are ever in RAM.
 """
 import aiohttp
 import asyncio
@@ -20,12 +16,12 @@ from urllib.parse import urlparse, unquote
 
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE = 50 * 1024 * 1024  # 50 MB per chunk
-UPLOAD_CONCURRENCY = 4  # parallel chunk uploads
+CHUNK_SIZE = 50 * 1024 * 1024       # 50 MB per chunk
+UPLOAD_CONCURRENCY = 4              # parallel chunk uploads (max RAM = 4 * 50MB = 200MB)
 VALID_LIFETIMES = {3, 5, 7, 14, 30, 60, 100}
 MAX_RETRIES = 3
-DOWNLOAD_READ_CHUNK = 2 * 1024 * 1024  # 2MB read buffer for downloads
-STALL_TIMEOUT = 120  # seconds
+DOWNLOAD_READ_CHUNK = 2 * 1024 * 1024   # 2MB streaming read for downloads
+STALL_TIMEOUT = 120                 # seconds without data -> stall detected
 
 
 def _extract_filename_from_cd(cd: str) -> Optional[str]:
@@ -46,8 +42,8 @@ def _filename_from_url(url: str) -> str:
     return unquote(name) if name else 'file'
 
 
-def _read_chunk_from_file(filepath: str, chunk_no: int) -> bytes:
-    """Read a single chunk from file on disk. Memory-safe: only 1 chunk in RAM."""
+def _read_chunk_sync(filepath: str, chunk_no: int) -> bytes:
+    """Read one chunk from file at given position. Sync helper for run_in_executor."""
     with open(filepath, 'rb') as f:
         f.seek(chunk_no * CHUNK_SIZE)
         return f.read(CHUNK_SIZE)
@@ -63,7 +59,6 @@ class GigaFileClient:
         now = time.monotonic()
         if self._server_cache and (now - self._server_cache_ts) < 300:
             return self._server_cache
-
         timeout = aiohttp.ClientTimeout(total=15, sock_connect=10, sock_read=10)
         async with aiohttp.ClientSession() as s:
             async with s.get('https://gigafile.nu/', timeout=timeout) as resp:
@@ -95,7 +90,6 @@ class GigaFileClient:
                 form.add_field('chunks', str(total_chunks))
                 form.add_field('lifetime', str(lifetime))
                 form.add_field('file', chunk_data, filename='blob', content_type='application/octet-stream')
-
                 timeout = aiohttp.ClientTimeout(total=600, sock_connect=30, sock_read=300)
                 async with session.post(
                     f'https://{server}/upload_chunk.php',
@@ -105,7 +99,7 @@ class GigaFileClient:
                     result = await resp.json()
                     return result
             except Exception as e:
-                logger.warning("Chunk %d/%d upload attempt %d failed: %s", chunk_no + 1, total_chunks, attempt + 1, e)
+                logger.warning("Chunk %d/%d attempt %d failed: %s", chunk_no + 1, total_chunks, attempt + 1, e)
                 if attempt == MAX_RETRIES - 1:
                     raise
                 await asyncio.sleep(2 ** attempt)
@@ -123,29 +117,34 @@ class GigaFileClient:
         progress_cb: Optional[Callable[[str, int], Awaitable[None]]] = None,
         cancel_event: Optional[asyncio.Event] = None,
     ) -> Optional[str]:
-        """Upload chunks from disk with controlled parallelism.
-        MEMORY-SAFE: reads one chunk at a time from disk, never loads all into RAM.
         """
-        result_url = None
-        sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+        MEMORY-SAFE chunk uploader.
+        Reads chunks from DISK inside the semaphore, so max RAM used
+        = UPLOAD_CONCURRENCY * CHUNK_SIZE (4 * 50MB = ~200MB) regardless of file size.
+        """
+        result_url: Optional[str] = None
         completed = 0
         lock = asyncio.Lock()
 
-        # First chunk must go first to establish session on GigaFile
-        first_data = _read_chunk_from_file(filepath, 0)
-        r = await self._upload_chunk(session, server, token, filename, first_data, 0, total_chunks, lifetime)
-        del first_data  # free memory immediately
+        # GigaFile requires first chunk to be uploaded first (establishes session)
+        loop = asyncio.get_event_loop()
+        first_chunk = await loop.run_in_executor(None, _read_chunk_sync, filepath, 0)
+        try:
+            r = await self._upload_chunk(session, server, token, filename, first_chunk, 0, total_chunks, lifetime)
+        finally:
+            del first_chunk  # free immediately
         if 'url' in r:
             result_url = r['url']
         completed = 1
-        if progress_cb:
-            pct = min(99, int(completed * 100 / total_chunks))
-            await progress_cb('upload', pct)
+        if progress_cb and total_chunks > 0:
+            await progress_cb('upload', min(99, int(completed * 100 / total_chunks)))
 
-        if total_chunks <= 1:
+        if total_chunks == 1:
             return result_url
 
-        # Upload remaining chunks in parallel, reading from disk on-demand
+        # Remaining chunks - semaphore limits concurrency AND memory usage
+        sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+
         async def upload_one(chunk_no: int):
             nonlocal result_url, completed
             if cancel_event and cancel_event.is_set():
@@ -153,56 +152,24 @@ class GigaFileClient:
             async with sem:
                 if cancel_event and cancel_event.is_set():
                     return
-                # Read chunk from disk right before uploading (memory-safe)
-                chunk_data = await asyncio.get_event_loop().run_in_executor(
-                    None, _read_chunk_from_file, filepath, chunk_no
-                )
+                # Read chunk from disk INSIDE the semaphore (memory-safe)
+                chunk_data = await loop.run_in_executor(None, _read_chunk_sync, filepath, chunk_no)
                 try:
-                    r = await self._upload_chunk(
-                        session, server, token, filename, chunk_data,
-                        chunk_no, total_chunks, lifetime
-                    )
+                    r = await self._upload_chunk(session, server, token, filename, chunk_data, chunk_no, total_chunks, lifetime)
                 finally:
-                    del chunk_data  # free memory immediately after upload
+                    del chunk_data  # free immediately after upload
+
                 if 'url' in r:
-                    async with lock:
-                        result_url = r['url']
+                    result_url = r['url']
                 async with lock:
                     completed += 1
                     if progress_cb:
                         pct = min(99, int(completed * 100 / total_chunks))
                         await progress_cb('upload', pct)
 
-        tasks = [upload_one(i) for i in range(1, total_chunks)]
+        tasks = [asyncio.create_task(upload_one(i)) for i in range(1, total_chunks)]
         await asyncio.gather(*tasks)
-
         return result_url
-
-    async def upload_bytes(
-        self,
-        data: bytes,
-        filename: str,
-        lifetime: int = 100,
-        progress_cb: Optional[Callable[[str, int], Awaitable[None]]] = None,
-    ) -> Dict[str, Any]:
-        """Upload bytes - saves to temp file first to use streaming upload."""
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp_path = tmp.name
-                tmp.write(data)
-            del data  # free the bytes from memory
-
-            return await self.upload_file_path(
-                tmp_path, lifetime=lifetime, progress_cb=progress_cb,
-                original_filename=filename,
-            )
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
 
     async def _download_with_retry(
         self,
@@ -212,7 +179,7 @@ class GigaFileClient:
         cancel_event: Optional[asyncio.Event] = None,
         session: Optional[aiohttp.ClientSession] = None,
     ) -> tuple[str, int]:
-        """Download file with retry logic and stall detection. Returns (filename, file_size)."""
+        """Stream-download file to disk. Returns (filename, bytes_written)."""
         filename = _filename_from_url(url) or 'file'
 
         for attempt in range(MAX_RETRIES):
@@ -222,12 +189,10 @@ class GigaFileClient:
                     sock_connect=30,
                     sock_read=STALL_TIMEOUT,
                 )
-
-                own_session = False
-                if session is None:
+                own_session = session is None
+                if own_session:
                     connector = aiohttp.TCPConnector(ssl=False, limit=0, force_close=False)
                     session = aiohttp.ClientSession(connector=connector)
-                    own_session = True
 
                 try:
                     async with session.get(url, allow_redirects=True, timeout=timeout) as resp:
@@ -246,6 +211,7 @@ class GigaFileClient:
                         total_size = int(resp.headers.get('Content-Length', 0))
                         downloaded = 0
 
+                        # Stream to disk - never keeps more than DOWNLOAD_READ_CHUNK in RAM
                         with open(tmp_path, 'wb') as f:
                             async for chunk in resp.content.iter_chunked(DOWNLOAD_READ_CHUNK):
                                 if cancel_event and cancel_event.is_set():
@@ -262,15 +228,14 @@ class GigaFileClient:
 
                         if progress_cb:
                             await progress_cb('download', 100)
-
                         return filename, downloaded
                 finally:
-                    if own_session:
+                    if own_session and session:
                         await session.close()
                         session = None
 
             except asyncio.TimeoutError:
-                logger.warning("Download attempt %d timed out (stall detection)", attempt + 1)
+                logger.warning("Download attempt %d timed out (stall)", attempt + 1)
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(2 ** attempt)
                     continue
@@ -323,7 +288,7 @@ class GigaFileClient:
                 with tempfile.NamedTemporaryFile(delete=False) as tmp:
                     tmp_path = tmp.name
 
-                # Download with retry and stall detection
+                # Stream download to disk (memory-safe)
                 filename, downloaded = await self._download_with_retry(
                     actual_download_url, tmp_path, progress_cb, cancel_event, session
                 )
@@ -336,15 +301,15 @@ class GigaFileClient:
             if downloaded == 0 and os.path.getsize(tmp_path) == 0:
                 return {'success': False, 'error': 'Download failed - empty file'}
 
-            # Upload phase - STREAMING from disk (memory-safe)
             file_size = os.path.getsize(tmp_path)
             total_chunks = max(1, math.ceil(file_size / CHUNK_SIZE))
 
             upload_connector = aiohttp.TCPConnector(limit=UPLOAD_CONCURRENCY + 2, force_close=False)
             async with aiohttp.ClientSession(connector=upload_connector) as up_session:
+                # MEMORY-SAFE: reads chunks from disk on demand
                 result_url = await self._upload_chunks_streaming(
-                    up_session, server, token, filename, tmp_path,
-                    total_chunks, lifetime, progress_cb, cancel_event
+                    up_session, server, token, filename, tmp_path, total_chunks, lifetime,
+                    progress_cb, cancel_event
                 )
 
             if progress_cb:
@@ -364,26 +329,49 @@ class GigaFileClient:
         filepath: str,
         lifetime: int = 100,
         progress_cb: Optional[Callable[[str, int], Awaitable[None]]] = None,
-        original_filename: Optional[str] = None,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> Dict[str, Any]:
+        """Upload file from local path. MEMORY-SAFE - reads chunks on demand."""
         server = await self.get_server()
         token = uuid.uuid1().hex
-        filename = original_filename or os.path.basename(filepath)
+        filename = os.path.basename(filepath)
         file_size = os.path.getsize(filepath)
         total_chunks = max(1, math.ceil(file_size / CHUNK_SIZE))
 
-        # STREAMING upload - reads from disk on-demand (memory-safe)
         upload_connector = aiohttp.TCPConnector(limit=UPLOAD_CONCURRENCY + 2, force_close=False)
         async with aiohttp.ClientSession(connector=upload_connector) as session:
             result_url = await self._upload_chunks_streaming(
-                session, server, token, filename, filepath,
-                total_chunks, lifetime, progress_cb
+                session, server, token, filename, filepath, total_chunks, lifetime,
+                progress_cb, cancel_event
             )
 
         if progress_cb:
             await progress_cb('upload', 100)
 
         return self._build_result(result_url, server, filename)
+
+    async def upload_bytes(
+        self,
+        data: bytes,
+        filename: str,
+        lifetime: int = 100,
+        progress_cb: Optional[Callable[[str, int], Awaitable[None]]] = None,
+    ) -> Dict[str, Any]:
+        """Upload from bytes. Saves to temp file to reuse memory-safe path."""
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f'_{filename}') as tmp:
+                tmp.write(data)
+                tmp_path = tmp.name
+            del data  # free original bytes buffer
+
+            return await self.upload_file_path(tmp_path, lifetime=lifetime, progress_cb=progress_cb)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     def _build_result(
         self,

@@ -10,7 +10,6 @@ import asyncio
 import aiohttp
 import re
 import tempfile
-import shutil
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional
@@ -126,7 +125,9 @@ async def telegram_webhook(request: Request):
     return Response(status_code=200)
 
 
-# GigaFile Upload API - MEMORY-SAFE: streams file to disk first
+# GigaFile Upload API
+UPLOAD_READ_CHUNK = 1 * 1024 * 1024  # 1MB streaming read for file uploads
+
 @api_router.post("/upload", response_model=UploadResponse, summary="Upload file to GigaFile.nu")
 async def upload_to_gigafile(
     file: Optional[UploadFile] = File(None),
@@ -136,32 +137,25 @@ async def upload_to_gigafile(
     if duration not in {3, 5, 7, 14, 30, 60, 100}:
         duration = 100
 
+    tmp_path = None
     try:
         if url:
             result = await gigafile_client.upload_from_url(url, lifetime=duration)
         elif file:
-            # MEMORY-SAFE: stream uploaded file to disk instead of reading into RAM
-            tmp_path = None
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename or 'upload'}") as tmp:
-                    tmp_path = tmp.name
-                    # Stream in 2MB chunks to avoid loading entire file into memory
-                    while True:
-                        chunk = await file.read(2 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        tmp.write(chunk)
-
-                result = await gigafile_client.upload_file_path(
-                    tmp_path, lifetime=duration,
-                    original_filename=file.filename or 'upload',
-                )
-            finally:
-                if tmp_path and os.path.exists(tmp_path):
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
+            # Stream uploaded file to disk before processing (memory-safe for large files)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f'_{file.filename or "upload"}') as tmp:
+                tmp_path = tmp.name
+                while True:
+                    chunk = await file.read(UPLOAD_READ_CHUNK)
+                    if not chunk:
+                        break
+                    tmp.write(chunk)
+            result = await gigafile_client.upload_file_path(
+                tmp_path, lifetime=duration
+            )
+            # Override filename with original
+            if result.get('success') and file.filename:
+                result['filename'] = file.filename
         else:
             raise HTTPException(status_code=400, detail="Provide 'file' or 'url'")
 
@@ -184,9 +178,15 @@ async def upload_to_gigafile(
     except Exception as e:
         logger.exception("Upload error")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
-# GigaFile Proxy Download - streaming (already memory-safe)
+# GigaFile Proxy Download
 @api_router.get("/proxy", summary="Proxy-download from GigaFile")
 async def proxy_gigafile(url: str):
     if 'gigafile.nu' not in url:
